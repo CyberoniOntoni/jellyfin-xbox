@@ -123,7 +123,7 @@
         getPlugins: function () {
             console.debug('getPlugins');
             postMessage('loaded');
-            return ["UwpXboxHdmiSetupPlugin"];
+            return ["UwpXboxHdmiSetupPlugin", "UwpSubtitleResumeSyncPlugin"];
         },
 
         selectServer: function () {
@@ -204,6 +204,173 @@ class UwpXboxHdmiSetupPlugin {
 }
 
 window["UwpXboxHdmiSetupPlugin"] = async () => UwpXboxHdmiSetupPlugin;
+
+/**
+ * Subtitle formats rendered client-side (SubtitlesOctopus / libpgs) that drift after resume.
+ * Native text formats (vtt, srt) are excluded — they sync via a different path.
+ */
+const BURN_IN_STYLE_SUBTITLE_CODECS = new Set([
+    'ass', 'ssa', 'pgssub', 'pgs', 'dvdsub', 'dvbsub', 'vobsub'
+]);
+
+const NATIVE_TEXT_SUBTITLE_CODECS = new Set([
+    'vtt', 'webvtt', 'srt', 'subrip'
+]);
+
+const RESUME_SYNC_CHECK_DELAYS_MS = [2000, 5000, 8000];
+const RESUME_SYNC_THRESHOLD_SEC = 0.5;
+const RESUME_SYNC_MAX_DELTA_SEC = 120;
+
+function getSubtitleDeliveryMethod(stream) {
+    if (!stream) {
+        return null;
+    }
+
+    if (stream.DeliveryMethod) {
+        return stream.DeliveryMethod;
+    }
+
+    return stream.IsExternal ? 'External' : 'Embed';
+}
+
+function isBurnInStyleSubtitle(stream) {
+    if (!stream) {
+        return false;
+    }
+
+    const codec = (stream.Codec || '').toLowerCase();
+
+    if (NATIVE_TEXT_SUBTITLE_CODECS.has(codec)) {
+        return false;
+    }
+
+    if (!BURN_IN_STYLE_SUBTITLE_CODECS.has(codec)) {
+        return false;
+    }
+
+    const delivery = getSubtitleDeliveryMethod(stream);
+    if (delivery === 'Encode') {
+        return false;
+    }
+
+    return true;
+}
+
+function getExpectedStartTicks(player) {
+    const playOptions = player?._currentPlayOptions;
+    return playOptions?.playerStartPositionTicks || 0;
+}
+
+function checkResumeSubtitlePosition(playbackManager, player, expectedTicks, checkLabel) {
+    const actualTicks = playbackManager.getCurrentTicks(player);
+    const deltaSec = (expectedTicks - actualTicks) / 10000000;
+    const absDeltaSec = Math.abs(deltaSec);
+
+    if (absDeltaSec < RESUME_SYNC_THRESHOLD_SEC) {
+        return;
+    }
+
+    if (absDeltaSec > RESUME_SYNC_MAX_DELTA_SEC) {
+        console.log(`[UwpSubtitleResumeSync] ${checkLabel}: delta ${deltaSec.toFixed(2)}s exceeds sanity cap, skipping`);
+        return;
+    }
+
+    const currentOffset = playbackManager.getPlayerSubtitleOffset(player) || 0;
+    const newOffset = currentOffset + deltaSec;
+
+    console.log(
+        `[UwpSubtitleResumeSync] ${checkLabel}: correcting offset by ${deltaSec.toFixed(2)}s ` +
+        `(expected ${(expectedTicks / 10000000).toFixed(1)}s, actual ${(actualTicks / 10000000).toFixed(1)}s, ` +
+        `offset ${currentOffset.toFixed(2)}s -> ${newOffset.toFixed(2)}s)`
+    );
+
+    playbackManager.setSubtitleOffset(newOffset, player);
+}
+
+/**
+ * Corrects ASS/SSA and other burn-in-style subtitle drift after resume playback.
+ */
+class UwpSubtitleResumeSyncPlugin {
+    constructor(pluginOptions) {
+        this.name = 'UWP Subtitle Resume Sync';
+        this.id = 'uwpsubtitleresumesync';
+        this.type = 'preplayintercept';
+        this.priority = -100;
+        this.PluginOptions = pluginOptions;
+        this._resumeSyncTimers = [];
+        this._activePlayer = null;
+
+        this.bindPlaybackEvents(pluginOptions);
+    }
+
+    intercept() {
+        return Promise.resolve();
+    }
+
+    bindPlaybackEvents(pluginOptions) {
+        const playbackManager = pluginOptions?.playbackManager;
+        const events = pluginOptions?.events;
+
+        if (!playbackManager || !events || playbackManager._uwpSubtitleResumeSyncApplied) {
+            return;
+        }
+
+        playbackManager._uwpSubtitleResumeSyncApplied = true;
+
+        events.on(playbackManager, 'playbackstart', (e, player) => {
+            this.onPlaybackStart(playbackManager, player);
+        });
+
+        events.on(playbackManager, 'playbackstop', () => {
+            this.clearResumeSyncTimers();
+        });
+    }
+
+    onPlaybackStart(playbackManager, player) {
+        this.clearResumeSyncTimers();
+        this._activePlayer = player;
+
+        const expectedTicks = getExpectedStartTicks(player);
+        if (expectedTicks <= 0) {
+            return;
+        }
+
+        RESUME_SYNC_CHECK_DELAYS_MS.forEach((delay, index) => {
+            const timer = setTimeout(() => {
+                if (this._activePlayer !== player) {
+                    return;
+                }
+
+                const subIndex = playbackManager.getSubtitleStreamIndex(player);
+                if (subIndex == null || subIndex === -1) {
+                    return;
+                }
+
+                const stream = playbackManager.getSubtitleStream(player, subIndex);
+                if (!isBurnInStyleSubtitle(stream)) {
+                    return;
+                }
+
+                checkResumeSubtitlePosition(
+                    playbackManager,
+                    player,
+                    expectedTicks,
+                    `check ${index + 1} @ ${delay}ms (${stream.Codec})`
+                );
+            }, delay);
+
+            this._resumeSyncTimers.push(timer);
+        });
+    }
+
+    clearResumeSyncTimers() {
+        this._resumeSyncTimers.forEach((timer) => clearTimeout(timer));
+        this._resumeSyncTimers = [];
+        this._activePlayer = null;
+    }
+}
+
+window["UwpSubtitleResumeSyncPlugin"] = async () => UwpSubtitleResumeSyncPlugin;
 
 if (!window.consoleXboxOverride)
 {
