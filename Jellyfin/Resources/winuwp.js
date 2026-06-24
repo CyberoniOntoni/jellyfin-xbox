@@ -97,8 +97,12 @@
                 if (supportsDolbyVision != null) {
                     options.supportsDolbyVision = supportsDolbyVision;
                 }
-                if (xboxSeries) {
-                    options.maxVideoWidth = 3840;
+                if (xbox) {
+                    // MSE cannot decode AC3 in HLS fMP4 despite WebView2 reporting support.
+                    options.disableHlsVideoAudioCodecs = ['ac3', 'eac3'];
+                    if (xboxSeries) {
+                        options.maxVideoWidth = 3840;
+                    }
                 }
                 return profileBuilder(options);
             },
